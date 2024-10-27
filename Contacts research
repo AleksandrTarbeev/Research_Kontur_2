@@ -1,0 +1,414 @@
+----------------------------------------------------------------------------------------------------------------------------------------------------
+-- Этап 1 Собираю данные по контактам
+----------------------------------------------------------------------------------------------------------------------------------------------------
+drop table if exists [Users].[a.tarbeev].[contacts];
+select 
+       poac.id
+	 , poac.ContactId
+	 , cast(poac.ActivityId as nvarchar(50)) as ActivityId
+     , poac.Number
+     , isnull(poac.AdditionalNumber, '')            as AdditionalNumber
+     , cast(poac.SourceTypeId as nvarchar(10)) as SourceTypeId
+     , poac.DateCreate
+     , poac.DateChange
+     , row_number() over (partition by poac.ActivityId
+                                     , poac.Number
+                                     , isnull(poac.AdditionalNumber, '')
+                          order by poac.DateCreate) as rn -- нумеруем дубли по дате создания
+into   [Users].[a.tarbeev].[contacts]
+from   Sales.dbo.PhoneOfActivityContact as poac
+where  exists (select 1 from CRM_DB.dbo.Activity as a where poac.ActivityId = a.Id and cast(a.DateChange as date) >= '20230101' and a.TypeId = '1') -- карточки, в которых были изменения с начала 2023
+       --and poac.SystemDeleted = 0;
+
+
+select count(distinct ActivityId) FROM [Users].[a.tarbeev].[contacts]
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.1 Создаю таблицу с чеками по контактам в рамках 3 сценариев:
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+drop table if exists #actiddist
+select distinct ActivityId into #actiddist from [Users].[a.tarbeev].[contacts]
+
+
+--1) добавляю тех у кого только один номер и его запись уникальная
+alter table #actiddist add onenumonly int;
+--alter table #actiddist drop column onenumonly;  
+update #actiddist
+set    onenumonly = 1
+where  ActivityId in (select ActivityId from [Users].[a.tarbeev].[contacts] group by ActivityId having count(cast(Number as varchar(50)) + AdditionalNumber) = '1');
+
+
+--2) имеют дубль того же номера минимум 2 раза
+alter table #actiddist add onenumdouble int;
+--alter table #actiddist drop column onenumdouble;  
+update #actiddist
+set    onenumdouble = 1
+where  ActivityId in (select distinct ActivityId from [Users].[a.tarbeev].[contacts] where rn>1);
+
+
+--3) имеют несколько разных номеров
+alter table #actiddist add distnum int;
+--alter table #actiddist drop column distnum;  
+update #actiddist
+set    distnum = 1
+where  ActivityId in (SELECT ActivityId from [Users].[a.tarbeev].[contacts] group by ActivityId having count(distinct cast(Number as varchar(50)) + AdditionalNumber) > 1);
+
+
+SELECT * from #actiddist
+
+-- Смотрю статистику по собравшимся данным
+drop table if exists [Users].[a.tarbeev].[StatContacts];
+select   onenumonly
+       , onenumdouble
+       , distnum
+       , count(ActivityId) as cntAct
+into     [Users].[a.tarbeev].[StatContacts]
+from     #actiddist
+group by onenumonly
+       , onenumdouble
+       , distnum
+order by onenumonly
+       , onenumdouble
+       , distnum;
+
+SELECT * FROM [Users].[a.tarbeev].[StatContacts]
+----------------------------------------------------------------------------------------------------------------------------------------------------
+-- Этап 2 Работаю с карточками, где есть дубли
+----------------------------------------------------------------------------------------------------------------------------------------------------
+-- Выбираю все дублирующиеся контакты 
+
+drop table if exists #numdoubles;
+select k.*
+     , a.Name
+     , a.Appointment
+     , row_number() over (partition by 
+                                       k.ActivityId
+                                     , k.Number
+                                     , k.AdditionalNumber
+                                     , k.SourceTypeId
+                          order by k.DateCreate) as rnSource
+into   #numdoubles
+from   [Users].[a.tarbeev].[contacts] as k
+left join [Sales].[dbo].[ActivityContact] as a on a.Id = k.ContactId
+join   (select distinct
+               ActivityId
+             , Number
+             , AdditionalNumber
+        from   [Users].[a.tarbeev].[contacts]
+        where  rn > 1)                         as d on d.ActivityId = k.ActivityId
+                                                       and d.Number = k.Number
+                                                       and d.AdditionalNumber = k.AdditionalNumber
+
+----------------------------------------------------------------------------------------------------------------------------------------------------
+-- 2.1 Собираю статистику с какого источника чаще всего приходит информация по контактам первой
+----------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Отвечаю на вопрос: "Чаще всего первым в карточку из задублированных контактов попадает источник..."
+select   distinct
+         SourceTypeId
+		 ,st.Description
+       , count(case when rn='1' then 1 end) as rn1
+       , count(case when rn='2' then 1 end) as rn2
+       , count(case when rn>'2' then 1 end) as rnelse
+from     #numdoubles as c
+left join [Sales].[dbo].[SourceType] as st on st.id=c.SourceTypeId
+group by SourceTypeId,  st.Description
+order by count(case when rn='1' then 1 end) desc;
+
+-- Делаю выборку по 4-ому ключу (ActivityId, Number, AdditionalNumber, SourceTypeId)
+drop table if exists #numdoublesSource;
+select n.*
+into   #numdoublesSource
+from   #numdoubles          as n
+join   (select distinct
+               ActivityId
+             , Number
+             , AdditionalNumber
+             , SourceTypeId
+        from   #numdoubles
+        where  rnSource > 1) as d on n.ActivityId = d.ActivityId
+                                     and d.Number = n.Number
+                                     and d.AdditionalNumber = n.AdditionalNumber
+                                     and d.SourceTypeId = n.SourceTypeId;
+
+
+-- Какой источник чаще всего дублируется в карточке
+select    distinct
+          SourceTypeId
+        , st.Description
+        , count(case when rnSource = '1' then 1 end) as rn1
+        , count(case when rnSource = '2' then 1 end) as rn2 -- Дублируется 1 раз
+        , count(case when rnSource = '3' then 1 end) as rn3 -- Дублируется 2 раза
+        , count(case when rnSource = '4' then 1 end) as rn4 -- Дублируется 3 раза
+        , count(case when rnSource > '4' then 1 end) as rnelse -- Дублируется больше 3 раз
+from      #numdoublesSource               as c
+left join [Sales].[dbo].[SourceType] as st on st.Id = c.SourceTypeId
+group by  SourceTypeId
+        , st.Description
+order by  count(case when rnSource = '1' then 1 end) desc;
+
+-- Изучаю странный рост rnelse для 500
+drop table if exists #doubles500;
+select   ActivityId
+       , Number
+       , AdditionalNumber
+       , SourceTypeId
+       , count(*) as cnt500
+into #doubles500
+from     #numdoublesSource
+where    SourceTypeId = '500'
+group by ActivityId
+       , Number
+       , AdditionalNumber
+       , SourceTypeId
+--order by count(*) desc;
+
+
+SELECT * FROM [Users].[a.tarbeev].[contacts] where ActivityId='1##31919-2101-4111-1111-11C11##11111' and Number='890##5015##' and SourceTypeId='500'
+order by rn
+
+SELECT top 100 * FROM #doubles500 order by cnt500 desc
+
+-- Статистика по когортам кол-ва дублей контактов карточки по источнику загрузки 500 (Импортировано из Билли) и количеству уникальных карточек попадающих в эти когорты
+with tab as (
+SELECT distinct
+d.ActivityId
+,case 
+	when d.cnt500 < '50' then '50'
+	when d.cnt500 < '100' then '100'
+	when d.cnt500 < '150' then '150'
+	when d.cnt500 < '360' then '360'
+	when d.cnt500 < '635' then '635'
+	else 'over 635'
+	end as category
+from #doubles500 d
+)
+SELECT 
+category
+,count (tab.ActivityId) as cntAct
+from tab
+group by category
+order by count (tab.ActivityId) desc
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 2.2 Создаю таблицу с чеками по дублям в рамках 5 сценариев:
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SELECT count(*) FROM #numdoubles
+--3 715 054
+SELECT top 100 * FROM #numdoubles
+
+drop table if exists #test;
+
+     select *
+, (ActivityId + Number + AdditionalNumber + isnull(SourceTypeId, '') + isnull(Name, '') + isnull(Appointment, '')) as keySc1
+, row_number() over (partition by (ActivityId + Number + AdditionalNumber + isnull(SourceTypeId, '') + isnull(Name, '')+ isnull(Appointment, '')) order by Number) as rnSc1
+, (ActivityId + Number + AdditionalNumber + isnull(Name, '') + isnull(Appointment, '')) as keySc2
+, row_number() over (partition by (ActivityId + Number + AdditionalNumber + isnull(Name, '') + isnull(Appointment, ''))order by Number) as rnSc2
+, (ActivityId + Number + AdditionalNumber + isnull(SourceTypeId, '') + isnull(Appointment, '')) as keySc3
+, row_number() over (partition by (ActivityId + Number + AdditionalNumber + isnull(SourceTypeId, '') + isnull(Appointment, '')) order by Number) as rnSc3
+, (ActivityId + Number + AdditionalNumber + isnull(SourceTypeId, '') + isnull(Name, '')) as keySc4
+, row_number() over (partition by (ActivityId + Number + AdditionalNumber + isnull(SourceTypeId, '') + isnull(Name, '')) order by Number) as rnSc4
+ into #test   
+	from   #numdoubles
+
+drop table if exists #test2;
+
+select t1.id
+     , t1.ContactId
+     , t1.ActivityId
+     , t1.Number
+     , t1.AdditionalNumber
+     , t1.SourceTypeId
+     , t1.DateCreate
+     , t1.DateChange
+     , t1.rn
+     , t1.Name
+     , t1.Appointment
+     , t1.rnSource
+     , t1.keySc1
+     , t1.rnSc1
+     , iif(exists (select top 1 t.keySc1 from #test as t where t.rnSc1 > 1 and t.keySc1 = t1.keySc1), 1, 0) as markSc1
+     , t1.keySc2
+     , t1.rnSc2
+     , iif(exists (select top 1 t.keySc2 from #test as t where t.rnSc2 > 1 and t.keySc2 = t1.keySc2), 1, 0) as markSc2
+     , t1.keySc3
+     , t1.rnSc3
+     , iif(exists (select top 1 t.keySc3 from #test as t where t.rnSc3 > 1 and t.keySc3 = t1.keySc3), 1, 0) as markSc3
+     , t1.keySc4
+     , t1.rnSc4
+     , iif(exists (select top 1 t.keySc4 from #test as t where t.rnSc4 > 1 and t.keySc4 = t1.keySc4), 1, 0) as markSc4
+into   #test2
+from   #test t1;
+
+select top 100 * from #test2 --where Number='83###6##1#4';
+
+-- есть ли номера которые встречаются в нескольких карточках
+with tab as (
+select 
+(Number + AdditionalNumber) as NumAdd
+, count(distinct ActivityId) as cntacid 
+from #test2 
+group by (Number + AdditionalNumber)
+)
+select 
+tab.cntacid
+, count(tab.NumAdd) as cntnum 
+from tab 
+group by tab.cntacid 
+order by tab.cntacid;
+-- cntacid - кол-во разных уникальных карточек в котрых встречается номер
+-- cntnum - кол-во номеров с таким сценарием
+-- пример: ######### номеров встречаются в 2х разных карточках
+-- пример: ######## номеров встречаются в 3х разных карточках
+-- если 1 - значит номер встречется только в одной карточке
+
+-- Собираю статистику по дублям в рамках 5 сценариев
+SELECT 
+  markSc1
+, markSc2
+, markSc3
+, markSc4
+, count(distinct ActivityId) as cntdistAct
+from #test2 
+group by markSc1, markSc2, markSc3, markSc4
+order by count(distinct ActivityId) desc
+
+select * from #test2 where markSc1 = '0' and markSc2 = '0' and markSc3 = '0' and markSc4 = '0';
+SELECT * FROM #test2 where Number='8##1#7####0'
+-- разное все
+
+select top 100 * from #test2 where markSc1 = '0' and markSc2 = '0' and markSc3 = '1' and markSc4 = '0';
+SELECT * FROM #test2 where keySc3='0##0##35-6##6-4B##-925F-B5D##82C7609##264##7504##0'
+-- разное имя
+
+select top 100 * from #test2 where markSc1 = '0' and markSc2 = '1' and markSc3 = '0' and markSc4 = '0';
+SELECT * FROM #test2 where keySc2='00015##B-6##A-4##4-##DC-460##076B##D8##12##6742Кон##кт НЮЛ/НИП для ИНН-КПП 6##9##94##1#-не валиди##вался, р##к'
+-- разный источник
+
+select top 100 * from #test2 where markSc1 = '0' and markSc2 = '0' and markSc3 = '0' and markSc4 = '1';
+SELECT * FROM #test2 where keySc4='0####61#-##AD-##CF-##B4-#53##E##05#88555##3699По###осить Л##ю'
+-- разная должность (или то что в ней написано)
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 2.3 Создаю дополнительный rn, где в рамках карточки есть полное совпадение по всем параметрам 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+drop table if exists #numdoublesSourceAllCut;
+select t.*
+     , row_number() over (partition by t.ActivityId, t.Number, t.AdditionalNumber, t.SourceTypeId order by t.DateCreate) as rnSourceAllCut
+into   #numdoublesSourceAllCut
+from   #test2 t
+where      markSc1 = '1'
+       and markSc2 = '1'
+       and markSc3 = '1'
+       and markSc4 = '1';
+
+
+SELECT top 100 * FROM #numdoublesSourceAllCut
+
+-- Какой источник чаще всего дублируется в карточке, где есть полное совпадение по всем параметрам в рамках карточки по (телефон, добавочный, источник, ФИО, должность)
+
+select    distinct
+          SourceTypeId
+        , st.Description
+        , count(case when rnSourceAllCut = '1' then 1 end) as rn1
+        , count(case when rnSourceAllCut = '2' then 1 end) as rn2 -- Дублируется 1 раз
+        , count(case when rnSourceAllCut = '3' then 1 end) as rn3 -- Дублируется 2 раза
+        , count(case when rnSourceAllCut = '4' then 1 end) as rn4 -- Дублируется 3 раза
+        , count(case when rnSourceAllCut > '4' then 1 end) as rnelse -- Дублируется больше 3 раз
+from      #numdoublesSourceAllCut               as c
+left join [Sales].[dbo].[SourceType] as st on st.Id = c.SourceTypeId
+group by  SourceTypeId
+        , st.Description
+order by  count(case when rnSourceAllCut = '1' then 1 end) desc;
+
+SELECT * FROM #test2 where ActivityId = '0005D4A0-FA77-4B73-9AAE-6A9C864AA86C'
+-- все одинаковое
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Этап 3 Статистика по дублям контактов в разрезе по предложениям.
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Беру только те карточки в которых контакт дублируется по всем параметрам (источник загрузки, ФИО, должность) и смотрю есть ли взаимосвязь с кол-вом предложений в карточке
+
+with tab as(
+select 
+       n.SourceTypeId
+     , n.ActivityId
+	 , count(o.Id) as cntOffer
+from #numdoublesSourceAllCut as n
+left join [Sales].[dbo].[Offer] as o on o.ActivityId = n.ActivityId
+group by
+       n.SourceTypeId
+     , n.ActivityId
+)
+SELECT 
+          t.SourceTypeId
+        , count(distinct t.ActivityId) as cntAct
+		, count(case when t.cntOffer = '0' then 1 end) as rn0 -- Кол-во офферов 0 в карточке, где есть полное совпадение по всем параметрам по (телефон, добавочный, источник, ФИО, должность)
+        , count(case when t.cntOffer = '1' then 1 end) as rn1 -- Кол-во офферов 1 в карточке, где есть полное совпадение по всем параметрам по (телефон, добавочный, источник, ФИО, должность)
+        , count(case when t.cntOffer = '2' then 1 end) as rn2 -- Кол-во офферов 2 в карточке, где есть полное совпадение по всем параметрам по (телефон, добавочный, источник, ФИО, должность)
+        , count(case when t.cntOffer = '3' then 1 end) as rn3 -- Кол-во офферов 3 в карточке, где есть полное совпадение по всем параметрам по (телефон, добавочный, источник, ФИО, должность)
+        , count(case when t.cntOffer = '4' then 1 end) as rn4 -- Кол-во офферов 4 в карточке, где есть полное совпадение по всем параметрам по (телефон, добавочный, источник, ФИО, должность)
+        , count(case when t.cntOffer > '4' then 1 end) as rnelse -- Кол-во офферов больше 4 в карточке, где есть полное совпадение по всем параметрам по (телефон, добавочный, источник, ФИО, должность)
+from tab t
+group by 
+  t.SourceTypeId
+
+
+-- Изучаю карточки написанные ручками менеджеров - NULL
+
+drop table if exists #doublesNULL;
+
+select   ActivityId
+       , Number
+       , AdditionalNumber
+       , SourceTypeId
+	   , Name
+       , Appointment
+       , count(*) as cntAll
+	   into #doublesNULL
+from     #numdoublesSourceAllCut
+where    SourceTypeId is NULL
+group by ActivityId
+       , Number
+       , AdditionalNumber
+       , SourceTypeId
+	   , Name
+       , Appointment
+order by count(*) desc;
+
+SELECT * FROM #doublesNULL order by cntAll desc
+
+-- Смотрю карточку с большим содержанием дублей
+--#0C###41-###D-###0-##48-3#####BB2###6A	8#8###30###
+SELECT 
+  n.ActivityId
+, n.DateCreate
+, n.DateChange
+, n.Number
+, n.AdditionalNumber
+, n.SourceTypeId
+, n.Name
+, n.Appointment
+from #numdoubles as n 
+where ActivityId='#0C###41-###D-###0-##48-3#####BB2###6A' and Number='8#8###30###' and SourceTypeId is NULL
+
+select top 100 * FROM #numdoublesSourceAllCut
+
+-- Статистика по когортам кол-ва дублей контактов карточки по источнику загрузку NULL(загружено менеджерами) и количеству уникальных карточек попадающих в эти когорты
+with tab as (
+SELECT distinct
+d.ActivityId
+,case 
+	when d.cntAll < '5' then '5'
+	when d.cntAll < '10' then '10'
+	when d.cntAll < '40' then '40'
+	else 'over 40'
+	end as category
+from #doublesNULL d
+)
+SELECT 
+category
+,count (tab.ActivityId) as cntAct
+from tab
+group by category
+order by count (tab.ActivityId) desc
